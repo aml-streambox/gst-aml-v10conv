@@ -7,6 +7,7 @@ int yuv422_gpu_gles_init(void);
 void yuv422_gpu_gles_cleanup(void);
 int yuv422_gpu_gles_convert_p010(const ConversionParams *params);
 int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height);
+int yuv422_gpu_gles_convert_p010_dmabuf_2p(int in_fd, int out_y_fd, int out_uv_fd, uint32_t width, uint32_t height);
 int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t height);
 const char *yuv422_gpu_gles_last_error(void);
 

@@ -78,6 +78,32 @@ typedef struct {
 
 static GpuCtx g = {0};
 
+static GLuint compile_cs(const char *src);
+static GLuint link_program(GLuint shader);
+
+static void repack_p010_to_wave5_msb(uint16_t *y, uint16_t *uv, uint32_t width, uint32_t height)
+{
+  uint32_t i;
+  uint32_t y_count = width * height;
+  uint32_t uv_count = (width * height) / 2;
+
+  for (i = 0; i < y_count; i++) {
+    uint16_t in = y[i];
+    uint16_t v10 = (uint16_t)(in >> 6);
+    uint16_t out = (uint16_t)(((v10 & 0x00FFu) << 8) | ((v10 >> 8) & 0x0003u));
+    y[i] = out;
+  }
+
+  for (i = 0; i < uv_count; i++) {
+    uint16_t in = uv[i];
+    uint16_t v10 = (uint16_t)(in >> 6);
+    uint16_t out = (uint16_t)(((v10 & 0x00FFu) << 8) | ((v10 >> 8) & 0x0003u));
+    uv[i] = out;
+  }
+}
+
+
+
 static double now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -192,6 +218,199 @@ static const char *shader_pack =
   "  uint b3 = texelFetch(in_tex, ivec2(int(x+3u), int(y)), 0).r;\n"
   "  in_data[y * WORDS_PER_ROW + wx] = b0 | (b1<<8u) | (b2<<16u) | (b3<<24u);\n"
   "}\n";
+
+static char *build_shader_y_dynamic(uint32_t width, uint32_t height)
+{
+  const char *tmpl =
+    "#version 310 es\n"
+    "precision highp int;\n"
+    "layout(local_size_x = 8, local_size_y = 1) in;\n"
+    "layout(std430, binding=0) readonly buffer InB { uint in_data[]; };\n"
+    "layout(std430, binding=1) writeonly buffer OutY { uint out_y[]; };\n"
+    "const uint PAIRS_PER_ROW = %uu;\n"
+    "const uint TILES_PER_ROW = %uu;\n"
+    "shared uint tile_words[40];\n"
+    "void main(){\n"
+    "  uint lane = gl_LocalInvocationID.x;\n"
+    "  uint tile_x = gl_WorkGroupID.x;\n"
+    "  uint r = gl_WorkGroupID.y;\n"
+    "  uint tile_word_base = (r * TILES_PER_ROW + tile_x) * 40u;\n"
+    "  uint lbase = lane * 5u;\n"
+    "  tile_words[lbase+0u] = in_data[tile_word_base + lbase + 0u];\n"
+    "  tile_words[lbase+1u] = in_data[tile_word_base + lbase + 1u];\n"
+    "  tile_words[lbase+2u] = in_data[tile_word_base + lbase + 2u];\n"
+    "  tile_words[lbase+3u] = in_data[tile_word_base + lbase + 3u];\n"
+    "  tile_words[lbase+4u] = in_data[tile_word_base + lbase + 4u];\n"
+    "  barrier();\n"
+    "  uint w0=tile_words[lbase+0u], w1=tile_words[lbase+1u], w2=tile_words[lbase+2u], w3=tile_words[lbase+3u], w4=tile_words[lbase+4u];\n"
+    "  uint y0_0=(w0>>10u)&0x3FFu; uint y0_1=((w0>>30u)|(w1<<2u))&0x3FFu;\n"
+    "  uint y1_0=(w1>>18u)&0x3FFu; uint y1_1=(w2>>6u)&0x3FFu;\n"
+    "  uint y2_0=((w2>>26u)|(w3<<6u))&0x3FFu; uint y2_1=(w3>>14u)&0x3FFu;\n"
+    "  uint y3_0=(w4>>2u)&0x3FFu; uint y3_1=(w4>>22u)&0x3FFu;\n"
+    "  uint p = r * PAIRS_PER_ROW + tile_x*32u + lane*4u;\n"
+    "  out_y[p+0u]=(y0_0<<6u)|((y0_1<<6u)<<16u);\n"
+    "  out_y[p+1u]=(y1_0<<6u)|((y1_1<<6u)<<16u);\n"
+    "  out_y[p+2u]=(y2_0<<6u)|((y2_1<<6u)<<16u);\n"
+    "  out_y[p+3u]=(y3_0<<6u)|((y3_1<<6u)<<16u);\n"
+    "}\n";
+  uint32_t pairs = width / 2;
+  uint32_t tiles = width / 64;
+  size_t cap = strlen(tmpl) + 64;
+  char *buf = (char *)malloc(cap);
+  if (!buf)
+    return NULL;
+  snprintf(buf, cap, tmpl, pairs, tiles);
+  (void)height;
+  return buf;
+}
+
+static char *build_shader_uv_dynamic(uint32_t width, uint32_t height)
+{
+  const char *tmpl =
+    "#version 310 es\n"
+    "precision highp int;\n"
+    "layout(local_size_x = 8, local_size_y = 1) in;\n"
+    "layout(std430, binding=0) readonly buffer InB { uint in_data[]; };\n"
+    "layout(std430, binding=1) writeonly buffer OutUV { uint out_uv[]; };\n"
+    "const uint PAIRS_PER_ROW = %uu;\n"
+    "const uint TILES_PER_ROW = %uu;\n"
+    "shared uint top_tile[40];\n"
+    "shared uint bot_tile[40];\n"
+    "void main(){\n"
+    "  uint lane = gl_LocalInvocationID.x;\n"
+    "  uint tile_x = gl_WorkGroupID.x;\n"
+    "  uint ur = gl_WorkGroupID.y;\n"
+    "  uint tr = ur*2u; uint br = tr+1u;\n"
+    "  uint tile_top_base = (tr * TILES_PER_ROW + tile_x) * 40u;\n"
+    "  uint tile_bot_base = (br * TILES_PER_ROW + tile_x) * 40u;\n"
+    "  uint lbase = lane * 5u;\n"
+    "  top_tile[lbase+0u] = in_data[tile_top_base + lbase + 0u];\n"
+    "  top_tile[lbase+1u] = in_data[tile_top_base + lbase + 1u];\n"
+    "  top_tile[lbase+2u] = in_data[tile_top_base + lbase + 2u];\n"
+    "  top_tile[lbase+3u] = in_data[tile_top_base + lbase + 3u];\n"
+    "  top_tile[lbase+4u] = in_data[tile_top_base + lbase + 4u];\n"
+    "  bot_tile[lbase+0u] = in_data[tile_bot_base + lbase + 0u];\n"
+    "  bot_tile[lbase+1u] = in_data[tile_bot_base + lbase + 1u];\n"
+    "  bot_tile[lbase+2u] = in_data[tile_bot_base + lbase + 2u];\n"
+    "  bot_tile[lbase+3u] = in_data[tile_bot_base + lbase + 3u];\n"
+    "  bot_tile[lbase+4u] = in_data[tile_bot_base + lbase + 4u];\n"
+    "  barrier();\n"
+    "  uint tw0=top_tile[lbase+0u], tw1=top_tile[lbase+1u], tw2=top_tile[lbase+2u], tw3=top_tile[lbase+3u], tw4=top_tile[lbase+4u];\n"
+    "  uint bw0=bot_tile[lbase+0u], bw1=bot_tile[lbase+1u], bw2=bot_tile[lbase+2u], bw3=bot_tile[lbase+3u], bw4=bot_tile[lbase+4u];\n"
+    "  uint u0t=tw0&0x3FFu, v0t=(tw0>>20u)&0x3FFu;\n"
+    "  uint u1t=(tw1>>8u)&0x3FFu, v1t=((tw1>>28u)|(tw2<<4u))&0x3FFu;\n"
+    "  uint u2t=(tw2>>16u)&0x3FFu, v2t=(tw3>>4u)&0x3FFu;\n"
+    "  uint u3t=((tw3>>24u)|(tw4<<8u))&0x3FFu, v3t=(tw4>>12u)&0x3FFu;\n"
+    "  uint u0b=bw0&0x3FFu, v0b=(bw0>>20u)&0x3FFu;\n"
+    "  uint u1b=(bw1>>8u)&0x3FFu, v1b=((bw1>>28u)|(bw2<<4u))&0x3FFu;\n"
+    "  uint u2b=(bw2>>16u)&0x3FFu, v2b=(bw3>>4u)&0x3FFu;\n"
+    "  uint u3b=((bw3>>24u)|(bw4<<8u))&0x3FFu, v3b=(bw4>>12u)&0x3FFu;\n"
+    "  uint p = ur * PAIRS_PER_ROW + tile_x*32u + lane*4u;\n"
+    "  out_uv[p+0u]=(((u0t+u0b+1u)>>1u)<<6u)|(((((v0t+v0b+1u)>>1u)<<6u))<<16u);\n"
+    "  out_uv[p+1u]=(((u1t+u1b+1u)>>1u)<<6u)|(((((v1t+v1b+1u)>>1u)<<6u))<<16u);\n"
+    "  out_uv[p+2u]=(((u2t+u2b+1u)>>1u)<<6u)|(((((v2t+v2b+1u)>>1u)<<6u))<<16u);\n"
+    "  out_uv[p+3u]=(((u3t+u3b+1u)>>1u)<<6u)|(((((v3t+v3b+1u)>>1u)<<6u))<<16u);\n"
+    "}\n";
+  uint32_t pairs = width / 2;
+  uint32_t tiles = width / 64;
+  size_t cap = strlen(tmpl) + 64;
+  char *buf = (char *)malloc(cap);
+  if (!buf)
+    return NULL;
+  snprintf(buf, cap, tmpl, pairs, tiles);
+  (void)height;
+  return buf;
+}
+
+static char *build_shader_pack_dynamic(uint32_t width, uint32_t height)
+{
+  const char *tmpl =
+    "#version 310 es\n"
+    "precision highp int;\n"
+    "precision highp usampler2D;\n"
+    "layout(local_size_x = 64, local_size_y = 1) in;\n"
+    "layout(binding=0) uniform highp usampler2D in_tex;\n"
+    "layout(std430, binding=0) writeonly buffer InWords { uint in_data[]; };\n"
+    "const uint WORDS_PER_ROW = %uu;\n"
+    "const uint HEIGHT = %uu;\n"
+    "void main(){\n"
+    "  uint wx = gl_GlobalInvocationID.x;\n"
+    "  uint y = gl_GlobalInvocationID.y;\n"
+    "  if (wx >= WORDS_PER_ROW || y >= HEIGHT) return;\n"
+    "  uint x = wx * 4u;\n"
+    "  uint b0 = texelFetch(in_tex, ivec2(int(x+0u), int(y)), 0).r;\n"
+    "  uint b1 = texelFetch(in_tex, ivec2(int(x+1u), int(y)), 0).r;\n"
+    "  uint b2 = texelFetch(in_tex, ivec2(int(x+2u), int(y)), 0).r;\n"
+    "  uint b3 = texelFetch(in_tex, ivec2(int(x+3u), int(y)), 0).r;\n"
+    "  in_data[y * WORDS_PER_ROW + wx] = b0 | (b1<<8u) | (b2<<16u) | (b3<<24u);\n"
+    "}\n";
+  uint32_t words_per_row = (width * 5) / 8;
+  size_t cap = strlen(tmpl) + 64;
+  char *buf = (char *)malloc(cap);
+  if (!buf)
+    return NULL;
+  snprintf(buf, cap, tmpl, words_per_row, height);
+  return buf;
+}
+
+static int rebuild_programs_for_resolution(uint32_t width, uint32_t height)
+{
+  GLuint old_y = g.program_y;
+  GLuint old_uv = g.program_uv;
+  GLuint old_pack = g.program_pack;
+  char *src_y = build_shader_y_dynamic(width, height);
+  char *src_uv = build_shader_uv_dynamic(width, height);
+  char *src_pack = build_shader_pack_dynamic(width, height);
+  GLuint new_y = 0, new_uv = 0, new_pack = 0;
+
+  if (!src_y || !src_uv || !src_pack) {
+    snprintf(g.last_error, sizeof(g.last_error), "failed to allocate dynamic shader source");
+    goto fail;
+  }
+
+  new_y = link_program(compile_cs(src_y));
+  if (!new_y)
+    goto fail;
+  new_uv = link_program(compile_cs(src_uv));
+  if (!new_uv)
+    goto fail;
+  new_pack = link_program(compile_cs(src_pack));
+  if (!new_pack)
+    goto fail;
+
+  g.program_y = new_y;
+  g.program_uv = new_uv;
+  g.program_pack = new_pack;
+  g.loc_pack_tex = glGetUniformLocation(g.program_pack, "in_tex");
+  g.loc_y_chunks = glGetUniformLocation(g.program_y, "u_chunks_per_row");
+  g.loc_y_pairs = glGetUniformLocation(g.program_y, "u_pairs_per_row");
+  g.loc_y_h = glGetUniformLocation(g.program_y, "u_h");
+  g.loc_uv_chunks = glGetUniformLocation(g.program_uv, "u_chunks_per_row");
+  g.loc_uv_pairs = glGetUniformLocation(g.program_uv, "u_pairs_per_row");
+  g.loc_uv_half_h = glGetUniformLocation(g.program_uv, "u_half_h");
+  if (old_y)
+    glDeleteProgram(old_y);
+  if (old_uv)
+    glDeleteProgram(old_uv);
+  if (old_pack)
+    glDeleteProgram(old_pack);
+  free(src_y);
+  free(src_uv);
+  free(src_pack);
+  return 0;
+
+fail:
+  if (new_y)
+    glDeleteProgram(new_y);
+  if (new_uv)
+    glDeleteProgram(new_uv);
+  if (new_pack)
+    glDeleteProgram(new_pack);
+  free(src_y);
+  free(src_uv);
+  free(src_pack);
+  return -1;
+}
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t id, const char *iface, uint32_t version) {
   (void)version;
@@ -382,14 +601,15 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   const uint32_t pairs = w / 2;
   const uint32_t half_h = h / 2;
 
-  if (w != 3840 || h != 2160) {
-    snprintf(g.last_error, sizeof(g.last_error), "fixed-kernel requires 3840x2160");
-    return -1;
-  }
-
   const uint32_t in_bytes = w * h * 5 / 2;
   const uint32_t y_bytes = w * h * 2;
   const uint32_t uv_bytes = pairs * half_h * 4;
+  const uint32_t dispatch_x = (w / 64);
+  const uint32_t dispatch_y = h;
+  const uint32_t dispatch_uv_y = half_h;
+
+  if (rebuild_programs_for_resolution(w, h) != 0)
+    return -1;
 
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_in);
   if (g.alloc_in_bytes < in_bytes) {
@@ -429,7 +649,7 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_y);
 
   glUseProgram(g.program_y);
-  glDispatchCompute(60, 2160, 1);
+  glDispatchCompute(dispatch_x, dispatch_y, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
   if (check_gl_error("dispatch y")) return -1;
   double t2 = now_ms();
@@ -443,7 +663,7 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_uv);
 
   glUseProgram(g.program_uv);
-  glDispatchCompute(60, 1080, 1);
+  glDispatchCompute(dispatch_x, dispatch_uv_y, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
   if (check_gl_error("dispatch uv")) return -1;
   double t3 = now_ms();
@@ -532,8 +752,61 @@ int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, u
   p.output_format = OUTPUT_YUV420_P010;
 
   int ret = yuv422_gpu_gles_convert_p010(&p);
+  if (ret == 0)
+    repack_p010_to_wave5_msb((uint16_t *)out_map, (uint16_t *)((uint8_t *)out_map + y_bytes), width, height);
 
   munmap(out_map, out_bytes);
+  munmap(in_map, in_bytes);
+  return ret;
+}
+
+int yuv422_gpu_gles_convert_p010_dmabuf_2p(int in_fd, int out_y_fd, int out_uv_fd, uint32_t width, uint32_t height)
+{
+  if (in_fd < 0 || out_y_fd < 0 || out_uv_fd < 0) {
+    snprintf(g.last_error, sizeof(g.last_error), "invalid dmabuf fd");
+    return -1;
+  }
+
+  size_t in_bytes = width * height * 5 / 2;
+  size_t y_bytes = width * height * 2;
+  size_t uv_bytes = (width / 2) * (height / 2) * 4;
+
+  void *in_map = mmap(NULL, in_bytes, PROT_READ, MAP_SHARED, in_fd, 0);
+  if (in_map == MAP_FAILED) {
+    snprintf(g.last_error, sizeof(g.last_error), "mmap input dmabuf failed");
+    return -1;
+  }
+
+  void *y_map = mmap(NULL, y_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_y_fd, 0);
+  if (y_map == MAP_FAILED) {
+    munmap(in_map, in_bytes);
+    snprintf(g.last_error, sizeof(g.last_error), "mmap output Y dmabuf failed");
+    return -1;
+  }
+
+  void *uv_map = mmap(NULL, uv_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_uv_fd, 0);
+  if (uv_map == MAP_FAILED) {
+    munmap(y_map, y_bytes);
+    munmap(in_map, in_bytes);
+    snprintf(g.last_error, sizeof(g.last_error), "mmap output UV dmabuf failed");
+    return -1;
+  }
+
+  ConversionParams p;
+  memset(&p, 0, sizeof(p));
+  p.width = width;
+  p.height = height;
+  p.input_data = (const uint8_t *)in_map;
+  p.output_y = (uint16_t *)y_map;
+  p.output_uv = (uint16_t *)uv_map;
+  p.output_format = OUTPUT_YUV420_P010;
+
+  int ret = yuv422_gpu_gles_convert_p010(&p);
+  if (ret == 0)
+    repack_p010_to_wave5_msb((uint16_t *)y_map, (uint16_t *)uv_map, width, height);
+
+  munmap(uv_map, uv_bytes);
+  munmap(y_map, y_bytes);
   munmap(in_map, in_bytes);
   return ret;
 }
@@ -541,7 +814,7 @@ int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, u
 int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t height)
 {
   if (!g.initialized) return -1;
-  if (in_fd < 0 || width != 3840 || height != 2160) {
+  if (in_fd < 0) {
     snprintf(g.last_error, sizeof(g.last_error), "invalid dmabuf input for compute path");
     return -1;
   }
@@ -560,13 +833,14 @@ int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t heig
     g.owner_thread = self_tid;
   }
 
+  uint32_t pitch = (width * 5) / 2;
   EGLint attrs[] = {
-    EGL_WIDTH, 9600,
-    EGL_HEIGHT, 2160,
+    EGL_WIDTH, pitch,
+    EGL_HEIGHT, height,
     EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
     EGL_DMA_BUF_PLANE0_FD_EXT, in_fd,
     EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-    EGL_DMA_BUF_PLANE0_PITCH_EXT, 9600,
+    EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch,
     EGL_NONE
   };
 
@@ -579,6 +853,14 @@ int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t heig
   uint32_t in_bytes = width * height * 5 / 2;
   uint32_t y_bytes = width * height * 2;
   uint32_t uv_bytes = (width / 2) * (height / 2) * 4;
+  uint32_t dispatch_x = ((pitch / 4) + 63) / 64;
+  uint32_t dispatch_y = height;
+  uint32_t dispatch_uv_y = height / 2;
+
+  if (rebuild_programs_for_resolution(width, height) != 0) {
+    g.eglDestroyImageKHR(g.egl_display, image);
+    return -1;
+  }
 
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_in);
   if (g.alloc_in_bytes < in_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_in_bytes = in_bytes; }
@@ -595,21 +877,21 @@ int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t heig
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, g.tex_in);
   glUniform1i(g.loc_pack_tex, 0);
-  glDispatchCompute((2400 + 63) / 64, 2160, 1);
+  glDispatchCompute(dispatch_x, dispatch_y, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_y);
   if (g.alloc_y_bytes < y_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, y_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_y_bytes = y_bytes; }
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_y);
   glUseProgram(g.program_y);
-  glDispatchCompute(60, 2160, 1);
+  glDispatchCompute(width / 64, height, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_uv);
   if (g.alloc_uv_bytes < uv_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, uv_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_uv_bytes = uv_bytes; }
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_uv);
   glUseProgram(g.program_uv);
-  glDispatchCompute(60, 1080, 1);
+  glDispatchCompute(width / 64, dispatch_uv_y, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
   GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);

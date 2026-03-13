@@ -139,7 +139,7 @@ GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/x-raw, "
-        "format = (string) { P010, WAVE521_32BIT }, "
+        "format = (string) { P010_10LE, P010, WAVE521_32BIT }, "
         "width = (int) [ 64, 4096 ], "
         "height = (int) [ 64, 2304 ], "
         "framerate = (fraction) [ 1/1, 60/1 ]")
@@ -214,6 +214,40 @@ ensure_gpu_dump_dmabuf (GstAmlYUV42210BitConv *self, gsize size)
   self->gpu_dump_map = map;
   self->gpu_dump_size = size;
   return TRUE;
+}
+
+static int
+alloc_dma_heap_fd (gsize size)
+{
+  const char *heaps[] = {
+    "/dev/dma_heap/heap-codecmm",
+    "/dev/dma_heap/heap-cached-codecmm",
+    "/dev/dma_heap/heap-gfx",
+    "/dev/dma_heap/system-uncached",
+    "/dev/dma_heap/system",
+    NULL
+  };
+  int i;
+
+  for (i = 0; heaps[i] != NULL; i++) {
+    int heapfd = open (heaps[i], O_RDWR | O_CLOEXEC);
+    struct dma_heap_allocation_data alloc_data;
+
+    if (heapfd < 0)
+      continue;
+
+    memset (&alloc_data, 0, sizeof (alloc_data));
+    alloc_data.len = size;
+    alloc_data.fd_flags = O_RDWR | O_CLOEXEC;
+
+    if (ioctl (heapfd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) == 0) {
+      close (heapfd);
+      return alloc_data.fd;
+    }
+    close (heapfd);
+  }
+
+  return -1;
 }
 
 /* Class initialization */
@@ -538,7 +572,8 @@ gst_aml_yuv422_10bit_conv_set_caps (GstBaseTransform * trans,
   /* Detect output format */
   format_str = gst_structure_get_string (s, "format");
   
-  if (g_strcmp0 (format_str, "P010") == 0) {
+  if (g_strcmp0 (format_str, "P010") == 0 ||
+      g_strcmp0 (format_str, "P010_10LE") == 0) {
     self->output_format = OUTPUT_YUV420_P010;
     /* Output: P010 = 2 bytes per pixel for Y, 4 bytes per 2x2 block for UV */
     self->out_size = (self->width * self->height * 2) + 
@@ -617,7 +652,12 @@ gst_aml_yuv422_10bit_conv_transform_caps (GstBaseTransform * trans,
     GstStructure *out_s;
 
     if (direction == GST_PAD_SINK) {
-      /* Transform sink caps to src caps (P010) */
+      /* Transform sink caps to src caps (P010_10LE) */
+      out_s = gst_structure_copy (s);
+      gst_structure_set (out_s, "format", G_TYPE_STRING, "P010_10LE", NULL);
+      gst_caps_append_structure (result, out_s);
+
+      /* Also keep P010 alias for compatibility */
       out_s = gst_structure_copy (s);
       gst_structure_set (out_s, "format", G_TYPE_STRING, "P010", NULL);
       gst_caps_append_structure (result, out_s);
@@ -720,6 +760,45 @@ gst_aml_yuv422_10bit_conv_prepare_output_buffer (GstBaseTransform * trans,
   GstAmlYUV42210BitConv *self = GST_AML_YUV422_10BIT_CONV (trans);
   (void) inbuf;
 
+  *outbuf = NULL;
+
+  if (self->output_format == OUTPUT_YUV420_P010) {
+    gsize y_size = self->width * self->height * 2;
+    gsize uv_size = self->width * self->height;
+    int y_fd = alloc_dma_heap_fd (y_size);
+    int uv_fd = alloc_dma_heap_fd (uv_size);
+
+    if (y_fd >= 0 && uv_fd >= 0) {
+      GstMemory *y_mem = gst_dmabuf_allocator_alloc (GST_DMABUF_ALLOCATOR (self->allocator), y_fd, y_size);
+      GstMemory *uv_mem = gst_dmabuf_allocator_alloc (GST_DMABUF_ALLOCATOR (self->allocator), uv_fd, uv_size);
+      if (y_mem && uv_mem) {
+        *outbuf = gst_buffer_new ();
+        gst_buffer_append_memory (*outbuf, y_mem);
+        gst_buffer_append_memory (*outbuf, uv_mem);
+      } else {
+        if (y_mem)
+          gst_memory_unref (y_mem);
+        else
+          close (y_fd);
+        if (uv_mem)
+          gst_memory_unref (uv_mem);
+        else
+          close (uv_fd);
+      }
+    } else {
+      if (y_fd >= 0)
+        close (y_fd);
+      if (uv_fd >= 0)
+        close (uv_fd);
+    }
+
+    if (!*outbuf) {
+      GST_ERROR_OBJECT (self, "Failed to allocate DMABUF output buffer size=%u", self->out_size);
+      return GST_FLOW_ERROR;
+    }
+    return GST_FLOW_OK;
+  }
+
   *outbuf = gst_buffer_new_allocate (NULL, self->out_size, NULL);
   if (!*outbuf) {
     GST_ERROR_OBJECT (self, "Failed to allocate output buffer size=%u", self->out_size);
@@ -737,6 +816,8 @@ gst_aml_yuv422_10bit_conv_transform (GstBaseTransform * trans,
 {
   GstAmlYUV42210BitConv *self = GST_AML_YUV422_10BIT_CONV (trans);
   GstMapInfo in_map, out_map;
+  GstMapInfo out_map_y, out_map_uv;
+  gboolean out_map_mode_split = FALSE;
   GstFlowReturn ret = GST_FLOW_OK;
   ConversionParams params;
   guint64 start_time, end_time;
@@ -755,124 +836,43 @@ gst_aml_yuv422_10bit_conv_transform (GstBaseTransform * trans,
         self->in_size, self->out_size);
   }
 
-  /* GPU mode requires strict DMABUF->DMABUF conversion */
+  /* GPU mode prefers strict DMABUF->DMABUF conversion */
   if (self->use_hw == AML_V10CONV_HW_GPU && self->output_format == OUTPUT_YUV420_P010) {
     GstMemory *in_mem0 = gst_buffer_n_memory(inbuf) > 0 ? gst_buffer_peek_memory(inbuf, 0) : NULL;
     GstMemory *out_mem0 = gst_buffer_n_memory(outbuf) > 0 ? gst_buffer_peek_memory(outbuf, 0) : NULL;
     if (!(in_mem0 && out_mem0 && gst_is_dmabuf_memory(in_mem0) && gst_is_dmabuf_memory(out_mem0))) {
-      if (!self->dump_output) {
-        if (in_mem0 && gst_is_dmabuf_memory(in_mem0)) {
-          int in_fd = gst_dmabuf_memory_get_fd(in_mem0);
-          if (in_fd >= 0) {
-            if (yuv422_gpu_gles_compute_p010_dmabuf(in_fd, self->width, self->height) != 0) {
-              GST_ERROR_OBJECT (self, "GPU dmabuf compute-only failed (%s)",
-                  yuv422_gpu_gles_last_error ());
-              return GST_FLOW_ERROR;
-            }
-          } else {
-            GST_ERROR_OBJECT (self, "Invalid DMABUF input fd in compute-only path");
-            return GST_FLOW_ERROR;
-          }
-        } else {
-          GstMapInfo in_map_gpu;
-          ConversionParams gpu_params;
-          memset (&gpu_params, 0, sizeof(gpu_params));
-          if (!gst_buffer_map (inbuf, &in_map_gpu, GST_MAP_READ)) {
-            GST_ERROR_OBJECT (self, "Failed to map input buffer for GPU compute-only path");
-            return GST_FLOW_ERROR;
-          }
-          gpu_params.width = self->width;
-          gpu_params.height = self->height;
-          gpu_params.input_data = in_map_gpu.data;
-          gpu_params.output_format = OUTPUT_YUV420_P010;
-          if (yuv422_gpu_gles_convert_p010 (&gpu_params) != 0) {
-            gst_buffer_unmap (inbuf, &in_map_gpu);
-            GST_ERROR_OBJECT (self, "GPU compute-only conversion failed (%s)",
-                yuv422_gpu_gles_last_error ());
-            return GST_FLOW_ERROR;
-          }
-          gst_buffer_unmap (inbuf, &in_map_gpu);
-        }
-
-        gsize sz = gst_buffer_get_size(outbuf);
-        if (sz > 0) gst_buffer_memset(outbuf, 0, 0, sz);
-        end_time = gst_util_get_timestamp ();
-        if ((self->frame_count % 30) == 1) {
-          guint64 dur_us_dbg = (end_time - start_time) / GST_USECOND;
-          gdouble dur_ms_dbg = ((gdouble) (end_time - start_time)) / ((gdouble) GST_MSECOND);
-          GST_WARNING_OBJECT (self, "GPU mode userspace sink detected: output is faked (dump-output=false)");
-          GST_WARNING_OBJECT (self,
-              "frame=%" G_GUINT64_FORMAT " compute-only path in %" G_GUINT64_FORMAT " us (%.3f ms, output faked)",
-              self->frame_count, dur_us_dbg, dur_ms_dbg);
-        }
-        return GST_FLOW_OK;
-      }
-      if (!(in_mem0 && gst_is_dmabuf_memory(in_mem0))) {
-        GST_ERROR_OBJECT (self, "GPU dump-output=true requires DMABUF input");
-        return GST_FLOW_ERROR;
-      }
-      if (!ensure_gpu_dump_dmabuf (self, self->out_size)) {
-        GST_ERROR_OBJECT (self, "Failed to allocate internal dump DMABUF size=%u", self->out_size);
-        return GST_FLOW_ERROR;
-      }
-
-      int in_fd = gst_dmabuf_memory_get_fd(in_mem0);
-      if (in_fd < 0) {
-        GST_ERROR_OBJECT (self, "Invalid DMABUF input fd for dump-output=true");
-        return GST_FLOW_ERROR;
-      }
-      if (yuv422_gpu_gles_convert_p010_dmabuf(in_fd, self->gpu_dump_fd, self->width, self->height) != 0) {
-        GST_ERROR_OBJECT (self, "GPU dmabuf conversion failed (%s)",
-            yuv422_gpu_gles_last_error ());
-        return GST_FLOW_ERROR;
-      }
-
-      if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
-        GST_ERROR_OBJECT (self, "Failed to map output buffer for dump copy");
-        return GST_FLOW_ERROR;
-      }
-      if (out_map.size < self->out_size) {
-        GST_ERROR_OBJECT (self, "Output buffer too small for dump copy: %" G_GSIZE_FORMAT " < %u", out_map.size, self->out_size);
-        gst_buffer_unmap (outbuf, &out_map);
-        return GST_FLOW_ERROR;
-      }
-      memcpy (out_map.data, self->gpu_dump_map, self->out_size);
-      gst_buffer_unmap (outbuf, &out_map);
-
-      end_time = gst_util_get_timestamp ();
-      if ((self->frame_count % 30) == 1) {
-        guint64 dur_us_dbg = (end_time - start_time) / GST_USECOND;
-        gdouble dur_ms_dbg = ((gdouble) (end_time - start_time)) / ((gdouble) GST_MSECOND);
-        GST_WARNING_OBJECT (self,
-            "frame=%" G_GUINT64_FORMAT " dump-output copy path in %" G_GUINT64_FORMAT " us (%.3f ms)",
-            self->frame_count, dur_us_dbg, dur_ms_dbg);
-      }
-      return GST_FLOW_OK;
-    }
-
-    int in_fd = gst_dmabuf_memory_get_fd(in_mem0);
-    int out_fd = gst_dmabuf_memory_get_fd(out_mem0);
-    if (in_fd < 0 || out_fd < 0) {
-      GST_ERROR_OBJECT (self, "Invalid DMABUF fd in GPU mode");
-      return GST_FLOW_ERROR;
-    }
-
-    if (yuv422_gpu_gles_convert_p010_dmabuf(in_fd, out_fd, self->width, self->height) != 0) {
-      GST_ERROR_OBJECT (self, "GPU dmabuf conversion failed (%s)",
-          yuv422_gpu_gles_last_error ());
-      return GST_FLOW_ERROR;
-    }
-
-    end_time = gst_util_get_timestamp ();
-    if ((self->frame_count % 30) == 1) {
-      guint64 dur_us_dbg = (end_time - start_time) / GST_USECOND;
-      gdouble dur_ms_dbg = ((gdouble) (end_time - start_time)) / ((gdouble) GST_MSECOND);
       GST_WARNING_OBJECT (self,
-          "frame=%" G_GUINT64_FORMAT " converted in %" G_GUINT64_FORMAT " us (%.3f ms, GPU-dmabuf)",
-          self->frame_count, dur_us_dbg, dur_ms_dbg);
+          "GPU path requires DMABUF in/out; fallback to NEON mapped path (in_dmabuf=%d out_dmabuf=%d)",
+          (in_mem0 && gst_is_dmabuf_memory(in_mem0)) ? 1 : 0,
+          (out_mem0 && gst_is_dmabuf_memory(out_mem0)) ? 1 : 0);
+      self->use_hw = AML_V10CONV_HW_NEON;
+    } else {
+      GstMemory *out_mem1 = gst_buffer_n_memory(outbuf) > 1 ? gst_buffer_peek_memory(outbuf, 1) : NULL;
+      int in_fd = gst_dmabuf_memory_get_fd(in_mem0);
+      int out_y_fd = gst_dmabuf_memory_get_fd(out_mem0);
+      int out_uv_fd = (out_mem1 && gst_is_dmabuf_memory(out_mem1)) ? gst_dmabuf_memory_get_fd(out_mem1) : -1;
+      if (in_fd < 0 || out_y_fd < 0 || out_uv_fd < 0) {
+        GST_WARNING_OBJECT (self, "Invalid DMABUF fd in GPU mode, fallback to NEON mapped path");
+        self->use_hw = AML_V10CONV_HW_NEON;
+      } else {
+        int gpu_ret = yuv422_gpu_gles_convert_p010_dmabuf_2p(in_fd, out_y_fd, out_uv_fd, self->width, self->height);
+        if (gpu_ret != 0) {
+          GST_WARNING_OBJECT (self, "GPU dmabuf conversion failed (%s), fallback to NEON mapped path",
+              yuv422_gpu_gles_last_error ());
+          self->use_hw = AML_V10CONV_HW_NEON;
+        } else {
+          end_time = gst_util_get_timestamp ();
+          if ((self->frame_count % 30) == 1) {
+            guint64 dur_us_dbg = (end_time - start_time) / GST_USECOND;
+            gdouble dur_ms_dbg = ((gdouble) (end_time - start_time)) / ((gdouble) GST_MSECOND);
+            GST_WARNING_OBJECT (self,
+                "frame=%" G_GUINT64_FORMAT " converted in %" G_GUINT64_FORMAT " us (%.3f ms, GPU-dmabuf)",
+                self->frame_count, dur_us_dbg, dur_ms_dbg);
+          }
+          return GST_FLOW_OK;
+        }
+      }
     }
-
-    return GST_FLOW_OK;
   }
 
   /* Map input buffer */
@@ -881,19 +881,44 @@ gst_aml_yuv422_10bit_conv_transform (GstBaseTransform * trans,
     return GST_FLOW_ERROR;
   }
 
-  /* Map output buffer */
-  if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
-    GST_ERROR_OBJECT (self, "Failed to map output buffer");
-    gst_buffer_unmap (inbuf, &in_map);
-    return GST_FLOW_ERROR;
+  memset (&out_map, 0, sizeof (out_map));
+  memset (&out_map_y, 0, sizeof (out_map_y));
+  memset (&out_map_uv, 0, sizeof (out_map_uv));
+
+  if (self->output_format == OUTPUT_YUV420_P010 && gst_buffer_n_memory (outbuf) >= 2) {
+    GstMemory *mem_y = gst_buffer_peek_memory (outbuf, 0);
+    GstMemory *mem_uv = gst_buffer_peek_memory (outbuf, 1);
+    if (!mem_y || !mem_uv ||
+        !gst_memory_map (mem_y, &out_map_y, GST_MAP_WRITE) ||
+        !gst_memory_map (mem_uv, &out_map_uv, GST_MAP_WRITE)) {
+      if (out_map_y.memory)
+        gst_memory_unmap (out_map_y.memory, &out_map_y);
+      if (out_map_uv.memory)
+        gst_memory_unmap (out_map_uv.memory, &out_map_uv);
+      GST_ERROR_OBJECT (self, "Failed to map split output planes");
+      gst_buffer_unmap (inbuf, &in_map);
+      return GST_FLOW_ERROR;
+    }
+    out_map_mode_split = TRUE;
+  } else {
+    if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
+      GST_ERROR_OBJECT (self, "Failed to map output buffer");
+      gst_buffer_unmap (inbuf, &in_map);
+      return GST_FLOW_ERROR;
+    }
   }
 
   GST_LOG_OBJECT (self, "Transform: in=%p (%" G_GSIZE_FORMAT " bytes), out=%p (%" G_GSIZE_FORMAT " bytes)",
       in_map.data, in_map.size, out_map.data, out_map.size);
 
-  if (in_map.size < self->in_size || out_map.size < self->out_size) {
+  if (in_map.size < self->in_size ||
+      ((!out_map_mode_split && out_map.size < self->out_size) ||
+       (out_map_mode_split && (out_map_y.size < (gsize)(self->width * self->height * 2) ||
+                           out_map_uv.size < (gsize)(self->width * self->height))))) {
     GST_ERROR_OBJECT (self, "Buffer too small: in=%" G_GSIZE_FORMAT "/%u out=%" G_GSIZE_FORMAT "/%u",
-        in_map.size, self->in_size, out_map.size, self->out_size);
+        in_map.size, self->in_size,
+        out_map_mode_split ? (out_map_y.size + out_map_uv.size) : out_map.size,
+        self->out_size);
     ret = GST_FLOW_ERROR;
     goto done;
   }
@@ -909,8 +934,13 @@ gst_aml_yuv422_10bit_conv_transform (GstBaseTransform * trans,
 
   /* Call appropriate converter based on output format */
   if (self->output_format == OUTPUT_YUV420_P010) {
-    params.output_y = (guint16 *) out_map.data;
-    params.output_uv = (guint16 *) (out_map.data + self->width * self->height * 2);
+    if (out_map_mode_split) {
+      params.output_y = (guint16 *) out_map_y.data;
+      params.output_uv = (guint16 *) out_map_uv.data;
+    } else {
+      params.output_y = (guint16 *) out_map.data;
+      params.output_uv = (guint16 *) (out_map.data + self->width * self->height * 2);
+    }
     params.output_y_wave521 = NULL;
     params.output_uv_wave521 = NULL;
 
@@ -975,7 +1005,14 @@ gst_aml_yuv422_10bit_conv_transform (GstBaseTransform * trans,
 
 done:
   gst_buffer_unmap (inbuf, &in_map);
-  gst_buffer_unmap (outbuf, &out_map);
+  if (out_map_mode_split) {
+    if (out_map_y.memory)
+      gst_memory_unmap (out_map_y.memory, &out_map_y);
+    if (out_map_uv.memory)
+      gst_memory_unmap (out_map_uv.memory, &out_map_uv);
+  } else {
+    gst_buffer_unmap (outbuf, &out_map);
+  }
 
   return ret;
 }
